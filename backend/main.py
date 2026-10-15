@@ -1,20 +1,35 @@
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from sqlalchemy import text
 from backend.database import engine
+from fastapi.middleware.cors import CORSMiddleware
+from backend.agents.mock_agent1 import recommend_price
+from backend.agents.mock_agent2 import publish_product
+from typing import Any
+from pydantic import BaseModel, Field
+import json
+
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-# 新增商品時，前端需要提供的資料
+# insert new product format
 class ProductCreate(BaseModel):
     name: str
-    cost: int
-    current_price: int
-    inventory: int
+    cost: int = Field(ge=0)
+    current_price: int = Field(ge=0)
+    inventory: int = Field(ge=0)
+    category: str | None = None
+    brand: str | None = None
+    specifications: dict[str, Any] = Field(default_factory=dict)
 
-# 修改價格時，前端需要提供的資料
+# Price upsating format
 class ProductPriceUpdate(BaseModel):
     current_price: int
 
@@ -83,15 +98,34 @@ def create_product(product: ProductCreate):
     with engine.begin() as connection:
         result = connection.execute(
             text("""
-                INSERT INTO products (name, cost, current_price, inventory)
-                VALUES (:name, :cost, :current_price, :inventory)
-                RETURNING id, name, cost, current_price, inventory
+                INSERT INTO products (
+                    name,
+                    cost,
+                    current_price,
+                    inventory,
+                    category,
+                    brand,
+                    specifications
+                )
+                VALUES (
+                    :name,
+                    :cost,
+                    :current_price,
+                    :inventory,
+                    :category,
+                    :brand,
+                    CAST(:specifications AS JSONB)
+                )
+                RETURNING *
             """),
             {
                 "name": product.name,
                 "cost": product.cost,
                 "current_price": product.current_price,
-                "inventory": product.inventory
+                "inventory": product.inventory,
+                "category": product.category,
+                "brand": product.brand,
+                "specifications": json.dumps(product.specifications)
             }
         )
 
@@ -153,3 +187,65 @@ def delete_product(product_id: int):
         "message": "Product deleted successfully",
         "deleted_product": dict(deleted_product)
     }
+
+
+@app.post("/workflow/{product_id}")
+def run_workflow(product_id: int):
+
+    # 1. get item from backend
+    with engine.connect() as connection:
+        result = connection.execute(
+            text("SELECT * FROM products WHERE id = :id"),
+            {"id": product_id}
+        )
+        product = result.mappings().first()
+
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    product = dict(product)
+
+    # 2. final pricing result from Agent 1
+    pricing_result = recommend_price(product)
+
+    # 3. modify info format for Agent 2
+    listing_data = {
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "price": pricing_result["suggested_price"],
+        "stock": product["inventory"],
+        "image_urls": [],
+        "target_platform": "mock_platform",
+        "platform_specific_data": {},
+        "variants": []
+    }
+
+    # 4. Agent 2 fake publish
+    listing_result = publish_product(listing_data)
+
+    # 5. Backend return
+    return {
+        "product_id": product_id,
+        "pricing_result": pricing_result,
+        "listing_result": listing_result
+    }
+
+
+# search sales history
+@app.get("/products/{product_id}/sales-history")
+def get_sales_history(product_id: int):
+
+    with engine.connect() as connection:
+        result = connection.execute(
+            text("""
+                SELECT product_id, period, price, units_sold
+                FROM sales_history
+                WHERE product_id = :product_id
+                ORDER BY period ASC
+            """),
+            {"product_id": product_id}
+        )
+
+        history = result.mappings().all()
+
+    return [dict(row) for row in history]
