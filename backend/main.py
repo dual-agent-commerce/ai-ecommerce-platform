@@ -1,16 +1,13 @@
-
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
-from backend.database import engine
+"""FastAPI entry point. Business endpoints live in backend/routers/."""
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from backend.agents.mock_agent1 import recommend_price
-from backend.agents.mock_agent2 import publish_product
-from typing import Any
-from pydantic import BaseModel, Field
-import json
+from fastapi.openapi.utils import get_openapi
 
+from backend.routers import products, pricing, listings, sean_pricing, sean_groups
+from backend.schemas import ErrorResponse
 
-app = FastAPI()
+app = FastAPI(title="AI E-commerce API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -19,233 +16,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# insert new product format
-class ProductCreate(BaseModel):
-    name: str
-    cost: int = Field(ge=0)
-    current_price: int = Field(ge=0)
-    inventory: int = Field(ge=0)
-    category: str | None = None
-    brand: str | None = None
-    specifications: dict[str, Any] = Field(default_factory=dict)
 
-# Price upsating format
-class ProductPriceUpdate(BaseModel):
-    current_price: int
-
-
-@app.get("/")
+@app.get("/", tags=["Health"])
 def root():
     return {"message": "AI E-commerce API is running"}
 
 
-# get all product
-@app.get("/products")
-def get_products():
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("SELECT * FROM products ORDER BY id")
-        )
+app.include_router(products.router)
+app.include_router(pricing.router)
+app.include_router(listings.router)
+app.include_router(sean_pricing.router)
+app.include_router(sean_groups.router)
 
-        products = [dict(row) for row in result.mappings()]
-
-    return products
-
-
-# get products by id
-@app.get("/products/{product_id}")
-def get_product(product_id: int):
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("SELECT * FROM products WHERE id = :id"),
-            {"id": product_id}
-        )
-
-        product = result.mappings().first()
-
-    if product is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found"
-        )
-
-    return dict(product)
+# OpenAPI documentation only; actual endpoint behavior is unchanged.
+ERROR_STATUSES: dict[tuple[str, str], tuple[int, ...]] = {
+    ("GET", "/products/{product_id}"): (404,),
+    ("PATCH", "/products/{product_id}/price"): (404,),
+    ("DELETE", "/products/{product_id}"): (404,),
+    ("POST", "/workflow/{product_id}"): (404, 502),
+    ("POST", "/workflow/reviews/{review_id}/approve"): (404, 409),
+    ("POST", "/workflow/reviews/{review_id}/reject"): (404, 409),
+    ("POST", "/listing-jobs/{job_id}/execute"): (404, 409, 502),
+    ("POST", "/listing-jobs/{job_id}/retry"): (409,),
+}
 
 
-# get products price by id
-@app.get("/products/price/{product_id}")
-def get_product_price(product_id: int):
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("SELECT current_price FROM products WHERE id = :id"),
-            {"id": product_id}
-        )
+def custom_openapi():
+    if app.openapi_schema is not None:
+        return app.openapi_schema
 
-        price = result.scalar_one_or_none()
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
 
-    if price is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found"
-        )
+    schema.setdefault("components", {}).setdefault("schemas", {})[
+        "ErrorResponse"
+    ] = ErrorResponse.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
 
-    return {"current_price": price}
+    descriptions = {
+        404: "Resource not found",
+        409: "Operation conflicts with current resource state",
+        502: "Agent execution failed or returned invalid data",
+    }
 
+    for (method, path), statuses in ERROR_STATUSES.items():
+        operation = schema.get("paths", {}).get(path, {}).get(method.lower())
+        if operation is None:
+            continue
 
-# insert new product
-@app.post("/products")
-def create_product(product: ProductCreate):
-    with engine.begin() as connection:
-        result = connection.execute(
-            text("""
-                INSERT INTO products (
-                    name,
-                    cost,
-                    current_price,
-                    inventory,
-                    category,
-                    brand,
-                    specifications
-                )
-                VALUES (
-                    :name,
-                    :cost,
-                    :current_price,
-                    :inventory,
-                    :category,
-                    :brand,
-                    CAST(:specifications AS JSONB)
-                )
-                RETURNING *
-            """),
-            {
-                "name": product.name,
-                "cost": product.cost,
-                "current_price": product.current_price,
-                "inventory": product.inventory,
-                "category": product.category,
-                "brand": product.brand,
-                "specifications": json.dumps(product.specifications)
+        responses = operation.setdefault("responses", {})
+        for status in statuses:
+            responses[str(status)] = {
+                "description": descriptions[status],
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": "#/components/schemas/ErrorResponse"}
+                    }
+                },
             }
-        )
 
-        new_product = dict(result.mappings().one())
-
-    return new_product
+    app.openapi_schema = schema
+    return schema
 
 
-# modify specific products price by id
-@app.patch("/products/{product_id}/price")
-def update_product_price(product_id: int, product: ProductPriceUpdate):
-    with engine.begin() as connection:
-        result = connection.execute(
-            text("""
-                UPDATE products
-                SET current_price = :price
-                WHERE id = :id
-                RETURNING id, name, current_price
-            """),
-            {
-                "price": product.current_price,
-                "id": product_id
-            }
-        )
-
-        updated_product = result.mappings().first()
-
-    if updated_product is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found"
-        )
-
-    return dict(updated_product)
-
-
-# delete product by id
-@app.delete("/products/{product_id}")
-def delete_product(product_id: int):
-    with engine.begin() as connection:
-        result = connection.execute(
-            text("""
-                DELETE FROM products
-                WHERE id = :id
-                RETURNING id, name
-            """),
-            {"id": product_id}
-        )
-
-        deleted_product = result.mappings().first()
-
-    if deleted_product is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found"
-        )
-
-    return {
-        "message": "Product deleted successfully",
-        "deleted_product": dict(deleted_product)
-    }
-
-
-@app.post("/workflow/{product_id}")
-def run_workflow(product_id: int):
-
-    # 1. get item from backend
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("SELECT * FROM products WHERE id = :id"),
-            {"id": product_id}
-        )
-        product = result.mappings().first()
-
-    if product is None:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    product = dict(product)
-
-    # 2. final pricing result from Agent 1
-    pricing_result = recommend_price(product)
-
-    # 3. modify info format for Agent 2
-    listing_data = {
-        "product_id": product["id"],
-        "product_name": product["name"],
-        "price": pricing_result["suggested_price"],
-        "stock": product["inventory"],
-        "image_urls": [],
-        "target_platform": "mock_platform",
-        "platform_specific_data": {},
-        "variants": []
-    }
-
-    # 4. Agent 2 fake publish
-    listing_result = publish_product(listing_data)
-
-    # 5. Backend return
-    return {
-        "product_id": product_id,
-        "pricing_result": pricing_result,
-        "listing_result": listing_result
-    }
-
-
-# search sales history
-@app.get("/products/{product_id}/sales-history")
-def get_sales_history(product_id: int):
-
-    with engine.connect() as connection:
-        result = connection.execute(
-            text("""
-                SELECT product_id, period, price, units_sold
-                FROM sales_history
-                WHERE product_id = :product_id
-                ORDER BY period ASC
-            """),
-            {"product_id": product_id}
-        )
-
-        history = result.mappings().all()
-
-    return [dict(row) for row in history]
+app.openapi = custom_openapi

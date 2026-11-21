@@ -236,3 +236,5 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+# External pricing service
+/integrations/sean-pricing/
