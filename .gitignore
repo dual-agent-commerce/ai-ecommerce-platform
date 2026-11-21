@@ -238,3 +238,4 @@ dist/
 Thumbs.db
 # External pricing service
 /integrations/sean-pricing/
+/integrations/gaku-scraping/
